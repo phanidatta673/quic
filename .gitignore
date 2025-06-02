@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# SSL Certificates
+*.pem
+*.key
+*.crt
+*.csr
+certs/
+
+# Upload directories
+uploads/
+
+# Log files
+*.log
+logs/
+
+# Test files
+file1.txt
+file2.txt
+file3.txt
+test_*.txt
+sample_*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# Environment variables
+.env
+.env.local

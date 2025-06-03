@@ -1,0 +1,38 @@
+# FastAPI and ASGI
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# QUIC dependencies (same as quic_core)
+aioquic>=0.9.20
+
+# Database and ORM
+sqlalchemy==2.0.23
+alembic==1.12.1
+
+# File handling and utilities
+aiofiles==23.2.1
+python-multipart==0.0.6
+
+# Environment and configuration
+python-dotenv==1.0.0
+
+# CORS and middleware
+
+
+# Validation and serialization
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# HTTP client for testing
+httpx==0.25.2
+
+# Background tasks
+celery==5.3.4
+redis==5.0.1
+
+# Logging and monitoring
+structlog==23.2.0
+
+# Development dependencies
+pytest==7.4.3
+pytest-asyncio==0.21.1

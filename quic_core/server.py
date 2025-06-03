@@ -6,7 +6,6 @@ Handles file transfers using QUIC protocol with chunking and parallel streams
 
 import asyncio
 import logging
-import os
 import hashlib
 from typing import Dict, Optional
 from dataclasses import dataclass
@@ -21,86 +20,95 @@ from aioquic.quic.events import QuicEvent, StreamDataReceived
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler("./logs/quic_server.log"),
-        logging.StreamHandler()  # still shows logs in terminal
+        logging.StreamHandler()
     ])
 logger = logging.getLogger(__name__)
 
 @dataclass
 class FileTransfer:
-    """Track ongoing file transfer state"""
     filename: str
     total_size: int
-    chunks_received: Dict[int, bytes]
     total_chunks: int
-    hash_expected: Optional[str] = None
+    received_chunks: Dict[int, bytes]
+    file_hash: Optional[str] = None
+    buffer: bytes = b""
 
 class QuicFileServerProtocol(QuicConnectionProtocol):
-    """QUIC protocol handler for file transfers"""
-    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.active_transfers: Dict[int, Dict] = {}  # stream_id -> transfer info
+        self.active_transfers: Dict[int, FileTransfer] = {}
+        self.stream_buffers: Dict[int, bytes] = {}  # stream_id -> buffered data
         self.upload_dir = Path("uploads")
         self.upload_dir.mkdir(exist_ok=True)
-    
+
     def quic_event_received(self, event: QuicEvent) -> None:
-        """Handle QUIC events"""
         if isinstance(event, StreamDataReceived):
             self.handle_stream_data(event.stream_id, event.data, event.end_stream)
-    
+
     def handle_stream_data(self, stream_id: int, data: bytes, end_stream: bool) -> None:
-        """Handle incoming stream data for file transfers"""
         try:
-            # Process the data if there is any
-            if data:
-                if data.startswith(b"FILE_START|"):
-                    message = data.decode("utf-8")
-                    parts = message.split("|")
-                    filename, size, total_chunks, file_hash = parts[1], int(parts[2]), int(parts[3]), parts[4]
-                    logger.info(f"Starting file transfer: {filename} ({size} bytes, {total_chunks} chunks)")
+            buffer = self.stream_buffers.get(stream_id, b"") + data
+            self.stream_buffers[stream_id] = buffer
 
-                    # Store transfer metadata
-                    self.active_transfers[stream_id] = {
-                        "filename": filename,
-                        "size": size,
-                        "total_chunks": total_chunks,
-                        "received_chunks": {},
-                        "file_hash": file_hash
-                    }
+            while b"|" in buffer:
+                if buffer.startswith(b"FILE_START|"):
+                    try:
+                        terminator = buffer.find(b"\n")
+                        if terminator == -1:
+                            return  # Wait for complete message
+                        message = buffer[:terminator].decode("utf-8")
+                        buffer = buffer[terminator + 1:]
+                        self.stream_buffers[stream_id] = buffer
 
-                    # Send FILE_START_ACK
-                    ack = f"FILE_START_ACK|{filename}".encode("utf-8")
-                    self._quic.send_stream_data(stream_id, ack)
-                    self.transmit()  # Actually send the data
+                        parts = message.split("|")
+                        if len(parts) != 5:
+                            raise ValueError("Invalid FILE_START format")
 
-                elif data.startswith(b"CHUNK|"):
-                    parts = data.split(b"|", 2)
-                    if len(parts) < 3:
-                        logger.warning(f"Malformed chunk received on stream {stream_id}")
+                        _, filename, size, total_chunks, file_hash = parts
+                        self.active_transfers[stream_id] = FileTransfer(
+                            filename=filename,
+                            total_size=int(size),
+                            total_chunks=int(total_chunks),
+                            received_chunks={},
+                            file_hash=file_hash,
+                            buffer=b""
+                        )
+                        logger.info(f"Started file transfer: {filename} ({size} bytes, {total_chunks} chunks)")
+                        ack = f"FILE_START_ACK|{filename}".encode("utf-8")
+                        self._quic.send_stream_data(stream_id, ack)
+                        self.transmit()
+                    except Exception as e:
+                        logger.error(f"FILE_START error: {e}")
+                        self.send_error_response(stream_id, str(e))
                         return
-                    chunk_id = int(parts[1])
+                elif buffer.startswith(b"CHUNK|"):
+                    parts = buffer.split(b"|", 2)
+                    if len(parts) < 3:
+                        return  # Wait for more data
+                    chunk_id_str = parts[1].decode("utf-8")
+                    try:
+                        chunk_id = int(chunk_id_str)
+                    except ValueError:
+                        self.send_error_response(stream_id, "Invalid CHUNK ID")
+                        return
                     chunk_data = parts[2]
 
                     if stream_id in self.active_transfers:
-                        self.active_transfers[stream_id]["received_chunks"][chunk_id] = chunk_data
-                        chunks_received = len(self.active_transfers[stream_id]["received_chunks"])
-                        total_chunks = self.active_transfers[stream_id]["total_chunks"]
-                        logger.info(f"Received chunk {chunk_id} on stream {stream_id} ({chunks_received}/{total_chunks})")
-                        
-                        # Send CHUNK_ACK
+                        self.active_transfers[stream_id].received_chunks[chunk_id] = chunk_data
+                        del self.stream_buffers[stream_id]
+
+                        logger.info(f"Received chunk {chunk_id} on stream {stream_id} ({len(self.active_transfers[stream_id].received_chunks)}/{self.active_transfers[stream_id].total_chunks})")
+
                         ack = f"CHUNK_ACK|{chunk_id}".encode("utf-8")
                         self._quic.send_stream_data(stream_id, ack)
-                        self.transmit()  # Actually send the data
+                        self.transmit()
                     else:
                         logger.warning(f"Chunk received for unknown stream {stream_id}")
-                        err = f"ERROR|No active transfer found for stream {stream_id}".encode("utf-8")
-                        self._quic.send_stream_data(stream_id, err)
-                        self.transmit()  # Actually send the data
-
+                        self.send_error_response(stream_id, f"No active transfer found for stream {stream_id}")
+                        return
                 else:
-                    logger.warning(f"Unexpected data on stream {stream_id}: {data[:50]}")
+                    break  # Wait for more data
 
-            # Handle stream end
             if end_stream:
                 logger.info(f"Stream {stream_id} ended")
                 self.handle_stream_end(stream_id)
@@ -108,74 +116,54 @@ class QuicFileServerProtocol(QuicConnectionProtocol):
         except Exception as e:
             logger.error(f"Failed to handle stream data: {e}")
             self.send_error_response(stream_id, str(e))
-    
+
     def handle_stream_end(self, stream_id: int) -> None:
-        """Handle end of stream - assemble and save file"""
         if stream_id in self.active_transfers:
             transfer = self.active_transfers[stream_id]
-            total_received = len(transfer["received_chunks"])
-            expected = transfer["total_chunks"]
-            filename = transfer["filename"]
-            size = transfer["size"]
-
-            logger.info(f"Processing stream end for {filename}: {total_received}/{expected} chunks received")
-
-            if total_received == expected:
-                # Assemble the file
+            total_received = len(transfer.received_chunks)
+            if total_received == transfer.total_chunks:
                 try:
-                    file_path = self.upload_dir / filename
+                    file_path = self.upload_dir / transfer.filename
                     with open(file_path, 'wb') as f:
-                        for chunk_id in sorted(transfer["received_chunks"].keys()):
-                            f.write(transfer["received_chunks"][chunk_id])
-                    
+                        for chunk_id in sorted(transfer.received_chunks):
+                            f.write(transfer.received_chunks[chunk_id])
+
                     # Verify file size
                     actual_size = file_path.stat().st_size
-                    if actual_size == size:
-                        logger.info(f"File {filename} saved successfully ({actual_size} bytes)")
-                        complete = f"FILE_COMPLETE|{filename}|{actual_size}".encode("utf-8")
-                        self._quic.send_stream_data(stream_id, complete)
-                        self.transmit()  # Actually send the data
-                    else:
-                        logger.error(f"File size mismatch: expected {size}, got {actual_size}")
-                        error = f"ERROR|File size mismatch".encode("utf-8")
-                        self._quic.send_stream_data(stream_id, error)
-                        self.transmit()  # Actually send the data
-                        
+                    if actual_size != transfer.total_size:
+                        raise ValueError("File size mismatch")
+
+                    # Verify hash
+                    if transfer.file_hash:
+                        with open(file_path, 'rb') as f:
+                            file_hash = hashlib.sha256(f.read()).hexdigest()
+                        if file_hash != transfer.file_hash:
+                            raise ValueError("Hash verification failed")
+
+                    logger.info(f"File {transfer.filename} saved successfully ({actual_size} bytes)")
+                    complete = f"FILE_COMPLETE|{transfer.filename}|{actual_size}".encode("utf-8")
+                    self._quic.send_stream_data(stream_id, complete)
+                    self.transmit()
                 except Exception as e:
-                    logger.error(f"Error saving file {filename}: {e}")
-                    error = f"ERROR|Failed to save file: {str(e)}".encode("utf-8")
-                    self._quic.send_stream_data(stream_id, error)
-                    self.transmit()  # Actually send the data
+                    logger.error(f"Error saving file: {e}")
+                    self.send_error_response(stream_id, str(e))
             else:
-                logger.warning(f"Incomplete transfer for {filename}: {total_received}/{expected} chunks received")
-                error = f"ERROR|Incomplete transfer. Received {total_received}/{expected} chunks.".encode("utf-8")
-                self._quic.send_stream_data(stream_id, error)
-                self.transmit()  # Actually send the data
-            
-            # Clean up
+                self.send_error_response(stream_id, f"Incomplete transfer. Received {total_received}/{transfer.total_chunks} chunks.")
             del self.active_transfers[stream_id]
-        else:
-            logger.warning(f"Stream end received for unknown stream {stream_id}")
-    
+            self.stream_buffers.pop(stream_id, None)
+
     def send_error_response(self, stream_id: int, error_msg: str) -> None:
-        """Send error response to client"""
-        response = f"ERROR|{error_msg}".encode('utf-8')
+        response = f"ERROR|{error_msg}".encode("utf-8")
         self._quic.send_stream_data(stream_id, response)
-        self.transmit()  # Actually send the data
+        self.transmit()
 
 async def main():
-    """Start the QUIC file transfer server"""
-    # Generate self-signed certificate for testing
     configuration = QuicConfiguration(
         alpn_protocols=["file-transfer"],
         is_client=False,
         max_datagram_frame_size=65536,
     )
-    
-    # For production, use proper certificates
     configuration.load_cert_chain("./certs/cert.pem", "./certs/key.pem")
-    
-    # Start server
     logger.info("Starting QUIC file transfer server on localhost:4433")
     await serve(
         host="localhost",
@@ -183,8 +171,6 @@ async def main():
         configuration=configuration,
         create_protocol=QuicFileServerProtocol,
     )
-
-    # Keep the server running
     await asyncio.Event().wait()
 
 if __name__ == "__main__":

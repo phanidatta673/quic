@@ -96,7 +96,7 @@ class MultiStreamQuicFileClient(QuicConnectionProtocol):
         logger.info(f"Starting async transfer: {file_path.name} on stream {stream_id}")
         
         # Send file metadata
-        metadata = f"FILE_START|{file_path.name}|{file_size}|{total_chunks}|{file_hash}"
+        metadata = f"FILE_START|{file_path.name}|{file_size}|{total_chunks}|{file_hash}\n"
         self._quic.send_stream_data(stream_id, metadata.encode('utf-8'))
         self.transmit()
         
